@@ -4,6 +4,7 @@ import { resolve, extname } from 'node:path';
 import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { openDb } from './db.mjs';
+import { eraseMembers, eraseInactiveMembers } from './member-cleanup.mjs';
 import { addDays, progress, recommend, slotState, windowState, taskStatus } from './logic.mjs';
 
 const id=()=>randomUUID(), now=()=>new Date().toISOString(), secret=()=>randomBytes(32).toString('base64url');
@@ -28,7 +29,7 @@ function session(db,req){const token=/tt_session=([^;]+)/.exec(req.headers.cooki
 function needMember(db,req,projectId){const m=session(db,req);if(!m)fail(401,'로그인이 필요합니다.');if(projectId&&m.project_id!==projectId)fail(403,'이 프로젝트에 접근할 수 없습니다.');return m;}
 function owner(m){if(m.role!=='owner')fail(403,'방장 권한이 필요합니다.');}
 function issueSession(db,memberId){const token=secret();run(db,'INSERT INTO sessions VALUES (?,?,?)',hash(token),memberId,new Date(Date.now()+180*86400000).toISOString());return `tt_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${180*86400}${process.env.COOKIE_SECURE==='1'?'; Secure':''}`;}
-function projectView(db,p,m){return {id:p.id,name:p.name,description:p.description,goal_date:p.goal_date,timezone:p.timezone,invite_open:p.invite_open,version:p.version,member:{id:m.id,nickname:m.nickname,role:m.role},members:all(db,'SELECT id,nickname,role,active,created_at FROM members WHERE project_id=? ORDER BY created_at',p.id)};}
+function projectView(db,p,m){return {id:p.id,name:p.name,description:p.description,goal_date:p.goal_date,timezone:p.timezone,invite_open:p.invite_open,version:p.version,member:{id:m.id,nickname:m.nickname,role:m.role},members:all(db,'SELECT id,nickname,role,active,created_at FROM members WHERE project_id=? AND active=1 ORDER BY created_at',p.id),inactive_member_count:m.role==='owner'?one(db,"SELECT COUNT(*) n FROM members WHERE project_id=? AND active=0 AND role!='owner'",p.id).n:0};}
 function scheduleData(db,p){const meetings=all(db,"SELECT * FROM meetings WHERE project_id=? AND status='confirmed'",p).map(x=>({...x,attendees:all(db,'SELECT member_id FROM meeting_attendees WHERE meeting_id=?',x.id).map(a=>a.member_id)}));return {schedules:all(db,'SELECT * FROM schedules WHERE project_id=?',p),exceptions:all(db,'SELECT e.* FROM date_exceptions e JOIN members m ON m.id=e.member_id WHERE m.project_id=?',p),confirmations:all(db,'SELECT c.* FROM availability_confirmations c JOIN members m ON m.id=c.member_id WHERE m.project_id=?',p),meetings};}
 function taskBundle(db,p){const tasks=all(db,'SELECT * FROM tasks WHERE project_id=? ORDER BY position,created_at',p),roles=all(db,'SELECT r.* FROM roles r JOIN tasks t ON t.id=r.task_id WHERE t.project_id=?',p);return {tasks:tasks.map(t=>{const rs=roles.filter(r=>r.task_id===t.id);const hasChildren=tasks.some(x=>x.parent_id===t.id);return {...t,status:hasChildren?null:taskStatus(rs),progress:progress(tasks,roles,t.id)??(hasChildren?null:(rs.length?rs.filter(r=>r.status==='done').length/rs.length:0))};}),roles,progress:progress(tasks,roles)};}
 function taskOf(db,m,taskId){const t=one(db,'SELECT * FROM tasks WHERE id=? AND project_id=?',taskId,m.project_id);if(!t)fail(404,'과제를 찾을 수 없습니다.');return t;}
@@ -80,8 +81,19 @@ export function createApp(db=openDb()){
       if(method==='PATCH'&&suffix===''){owner(m);if(b.version!==p.version)fail(409,'다른 사용자가 설정을 변경했습니다. 새로고침 후 다시 시도하세요.');const name=required(b.name??p.name,'프로젝트 이름');if(b.goal_date&&!dateOK(b.goal_date))fail(400,'종료일이 올바르지 않습니다.');run(db,'UPDATE projects SET name=?,description=?,goal_date=?,invite_open=?,version=version+1 WHERE id=?',name,String(b.description??p.description),b.goal_date===undefined?p.goal_date:(b.goal_date||null),b.invite_open===undefined?p.invite_open:(b.invite_open?1:0),projectId);audit(db,projectId,m.id,'project',projectId,'updated');return json(res,200,{ok:true});}
       if(method==='POST'&&suffix==='invite/rotate'){owner(m);const code=secret();run(db,'UPDATE projects SET invite_hash=?,invite_open=1,version=version+1 WHERE id=?',hash(code),projectId);audit(db,projectId,m.id,'project',projectId,'invite_rotated');return json(res,200,{inviteCode:code});}
       if(method==='POST'&&suffix==='invite/close'){owner(m);run(db,'UPDATE projects SET invite_open=0,version=version+1 WHERE id=?',projectId);audit(db,projectId,m.id,'project',projectId,'invite_closed');return json(res,200,{ok:true});}
+      if(method==='POST'&&suffix==='members/cleanup'){
+       owner(m);if(b.confirm_permanent!==true)fail(400,'기존 탈퇴·제외 멤버 기록의 영구 삭제를 확인하세요.');
+       return json(res,200,eraseInactiveMembers(db,projectId));
+      }
       const memberMatch=suffix.match(/^members\/([^/]+)$/);
-      if(method==='DELETE'&&memberMatch){const target=memberIn(db,projectId,memberMatch[1]);if(m.id!==target.id)owner(m);if(target.role==='owner')fail(400,'방장은 제외할 수 없습니다.');tx(db,()=>{run(db,'UPDATE members SET active=0 WHERE id=?',target.id);run(db,'DELETE FROM sessions WHERE member_id=?',target.id);audit(db,projectId,m.id,'member',target.id,'removed');});return json(res,200,{ok:true});}
+      if(method==='DELETE'&&memberMatch){
+       if(m.id!==memberMatch[1])owner(m);
+       const target=one(db,'SELECT * FROM members WHERE id=? AND project_id=?',memberMatch[1],projectId);
+       if(!target)fail(404,'멤버를 찾을 수 없습니다.');if(target.role==='owner')fail(400,'방장은 제외할 수 없습니다.');
+       if(b.confirm_permanent!==true)fail(400,'계정과 개인 기록의 영구 삭제를 확인하세요.');
+       eraseMembers(db,projectId,[target.id]);
+       return json(res,200,{ok:true},m.id===target.id?'tt_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0':undefined);
+      }
       if(method==='GET'&&suffix==='schedules'){const data=scheduleData(db,projectId);data.schedules=data.schedules.map(s=>s.member_id===m.id||s.share_title?s:{...s,title:''});return json(res,200,data);}
       if(method==='POST'&&suffix==='schedules'){
        const scope=`schedule:${m.id}`;if(remembered(db,scope,b.requestId,res))return;
