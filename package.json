@@ -1,10 +1,25 @@
 {
-  "name": "teamtime",
-  "private": true,
-  "type": "module",
   "scripts": {
-    "start": "node server.mjs",
-    "test": "node --test"
+    "start": {
+      "$type": "other",
+      "$value": "node server.mjs"
+    },
+    "test": {
+      "$type": "other",
+      "$value": "node --test"
+    }
   },
-  "engines": { "node": ">=24" }
+  "engines": {
+    "node": {
+      "$type": "other",
+      "$value": ">=24"
+    }
+  },
+  "$themes": [],
+  "$metadata": {
+    "tokenSetOrder": [
+      "scripts",
+      "engines"
+    ]
+  }
 }
