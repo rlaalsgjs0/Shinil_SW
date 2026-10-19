@@ -1,18 +1,18 @@
 {
   "scripts": {
     "start": {
-      "value": "node server.mjs",
-      "type": "other"
+      "$type": "other",
+      "$value": "node server.mjs"
     },
     "test": {
-      "value": "node --test",
-      "type": "other"
+      "$type": "other",
+      "$value": "node --test"
     }
   },
   "engines": {
     "node": {
-      "value": ">=24",
-      "type": "other"
+      "$type": "other",
+      "$value": ">=24"
     }
   },
   "$themes": [],
